@@ -1,0 +1,17 @@
+Bugfix: Make `prune` reject plans computed against a changed repository
+
+The prune command recorded the snapshots, index files and pack files it used
+to decide which data is still needed only once, while the actual deletions
+and repacking happened later. If another `backup` finished in between (for
+example when locks were bypassed with `--no-lock` or a stale lock was
+removed), prune could delete pack files that the new snapshot had just
+started to reference, or fail with a missing pack error. A dry-run could
+also report a different set of objects than the subsequent real run.
+
+Restic now records the exact repository state a prune plan is based on and
+re-checks it immediately before modifying anything. If snapshots, index
+files or pack files were added in the meantime, prune aborts with a clear
+error without deleting any data and can be rerun. Dry-run and a real run
+now derive their decisions through the same code path on the same state.
+
+https://github.com/restic/restic/issues/22041

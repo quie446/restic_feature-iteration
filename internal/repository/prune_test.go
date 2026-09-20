@@ -2,12 +2,14 @@ package repository_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"math/rand"
 	"testing"
 	"time"
 
+	"github.com/restic/restic/internal/backend"
 	"github.com/restic/restic/internal/repository"
 	"github.com/restic/restic/internal/repository/pack"
 	"github.com/restic/restic/internal/restic"
@@ -35,11 +37,11 @@ func testPrune(t *testing.T, opts repository.PruneOptions, errOnUnused bool) {
 		return nil
 	}))
 
-	plan, err := repository.PlanPrune(context.TODO(), opts, repo, func(ctx context.Context, repo restic.Repository, usedBlobs restic.FindBlobSet) error {
+	plan, err := repository.PlanPrune(context.TODO(), opts, repo, func(ctx context.Context, repo restic.Repository, usedBlobs restic.FindBlobSet) (restic.IDSet, error) {
 		for blob := range keep {
 			usedBlobs.Insert(blob)
 		}
-		return nil
+		return restic.NewIDSet(), nil
 	}, restic.NewNoopPrinter())
 	rtest.OK(t, err)
 
@@ -160,11 +162,11 @@ func TestPruneSmall(t *testing.T) {
 		MaxUnusedBytes: func(used uint64) (unused uint64) { return blobSize / 4 },
 		SmallPackBytes: 5 * 1024 * 1024,
 	}
-	plan, err := repository.PlanPrune(context.TODO(), opts, repo, func(ctx context.Context, repo restic.Repository, usedBlobs restic.FindBlobSet) error {
+	plan, err := repository.PlanPrune(context.TODO(), opts, repo, func(ctx context.Context, repo restic.Repository, usedBlobs restic.FindBlobSet) (restic.IDSet, error) {
 		for blob := range keep {
 			usedBlobs.Insert(blob)
 		}
-		return nil
+		return restic.NewIDSet(), nil
 	}, restic.NewNoopPrinter())
 	rtest.OK(t, err)
 	rtest.OK(t, plan.Execute(context.TODO(), restic.NewNoopPrinter()))
@@ -190,4 +192,168 @@ func TestPruneSmall(t *testing.T) {
 
 	rtest.Equals(t, lenPackfilesBefore > lenPackfilesAfter, true,
 		fmt.Sprintf("the number packfiles before %d and after repack %d", lenPackfilesBefore, lenPackfilesAfter))
+}
+
+// listPacksInBackend returns all pack files currently stored in the backend.
+func listPacksInBackend(t *testing.T, be backend.Backend) restic.IDSet {
+	t.Helper()
+	packs := restic.NewIDSet()
+	rtest.OK(t, be.List(context.TODO(), backend.PackFile, func(handle backend.FileInfo) error {
+		id, err := restic.ParseID(handle.Name)
+		rtest.OK(t, err)
+		packs.Insert(id)
+		return nil
+	}))
+	return packs
+}
+
+// planPruneWithBlobs builds a prune plan for a repository where exactly the
+// blobs in keep are still referenced.
+func planPruneWithBlobs(t *testing.T, repo *repository.Repository, keep restic.BlobSet, dryRun bool) *repository.PrunePlan {
+	t.Helper()
+	opts := repository.PruneOptions{
+		DryRun:         dryRun,
+		MaxRepackBytes: math.MaxUint64,
+		MaxUnusedBytes: func(_ uint64) uint64 { return 0 },
+	}
+	plan, err := repository.PlanPrune(context.TODO(), opts, repo, func(ctx context.Context, repo restic.Repository, usedBlobs restic.FindBlobSet) (restic.IDSet, error) {
+		for blob := range keep {
+			usedBlobs.Insert(blob)
+		}
+		return restic.NewIDSet(), nil
+	}, restic.NewNoopPrinter())
+	rtest.OK(t, err)
+	return plan
+}
+
+// setupConcurrentPruneRepo creates a repository with referenced and
+// unreferenced blobs and returns two repository handles on the same backend
+// (one for planning prune, one simulating a concurrent backup), the set of
+// referenced blobs and the backend.
+func setupConcurrentPruneRepo(t *testing.T) (*repository.Repository, *repository.Repository, restic.BlobSet, backend.Backend) {
+	t.Helper()
+	seed := time.Now().UnixNano()
+	random := rand.New(rand.NewSource(seed))
+	t.Logf("rand initialized with seed %d", seed)
+
+	repo, _, be := repository.TestRepositoryWithVersion(t, 0)
+	createRandomBlobs(t, random, repo, 4, 0.5, true)
+	keep, _ := selectBlobs(t, random, repo, 0.75)
+	rtest.Assert(t, len(keep) > 0, "test setup requires referenced blobs")
+
+	other := repository.TestOpenBackend(t, be)
+	rtest.OK(t, other.LoadIndex(context.TODO(), restic.NoopTerminalCounterFactory))
+
+	return repo, other, keep, be
+}
+
+// TestPrunePlanRevalidatesNewIndex pins down the reference/index view used by
+// prune: after the plan was computed, a backup finishing on the same
+// repository adds new packs and index files. Executing the stale plan must
+// fail instead of removing the freshly written data.
+func TestPrunePlanRevalidatesNewIndex(t *testing.T) {
+	repo, other, keep, be := setupConcurrentPruneRepo(t)
+
+	plan := planPruneWithBlobs(t, repo, keep, false)
+
+	// simulate a concurrent backup that finishes after the prune plan was
+	// created: it writes new blobs/packs and publishes a new index file
+	concurrentBlobs := restic.NewBlobSet()
+	rtest.OK(t, other.WithBlobUploader(context.TODO(), func(ctx context.Context, uploader restic.BlobSaverWithAsync) error {
+		for range 3 {
+			buf := make([]byte, 1024*1024)
+			rand.New(rand.NewSource(time.Now().UnixNano())).Read(buf)
+			id, _, _, err := uploader.SaveBlob(ctx, restic.DataBlob, buf, restic.ID{}, false)
+			rtest.OK(t, err)
+			concurrentBlobs.Insert(restic.BlobHandle{Type: restic.DataBlob, ID: id})
+		}
+		return nil
+	}))
+
+	err := plan.Execute(context.TODO(), restic.NewNoopPrinter())
+	rtest.Assert(t, errors.Is(err, repository.ErrRepositoryChanged), "expected ErrRepositoryChanged, got %v", err)
+
+	// none of the concurrent backup's data must have been removed
+	checkRepo := repository.TestOpenBackend(t, be)
+	rtest.OK(t, checkRepo.LoadIndex(context.TODO(), restic.NoopTerminalCounterFactory))
+	for blob := range concurrentBlobs {
+		buf, err := checkRepo.LoadBlob(context.TODO(), blob, nil)
+		rtest.OK(t, err)
+		rtest.Assert(t, len(buf) > 0, "blob %v was removed despite being written by a concurrent backup", blob)
+	}
+
+	// a fresh plan based on the updated index view must succeed
+	freshPlan := planPruneWithBlobs(t, checkRepo, keep, false)
+	rtest.OK(t, freshPlan.Execute(context.TODO(), restic.NewNoopPrinter()))
+
+	verified := repository.TestOpenBackend(t, be)
+	repository.TestCheckRepo(t, verified)
+}
+
+// TestPrunePlanRevalidatesUnindexedPacks verifies that a pack uploaded after
+// the plan was computed (but not yet covered by an index) is not deleted as an
+// unreferenced pack by the stale plan's execution.
+func TestPrunePlanRevalidatesUnindexedPacks(t *testing.T) {
+	repo, other, keep, be := setupConcurrentPruneRepo(t)
+
+	plan := planPruneWithBlobs(t, repo, keep, false)
+
+	before := listPacksInBackend(t, be)
+
+	// backup in progress: a new pack file exists, no index references it yet
+	rtest.OK(t, other.SavePackWithoutIndex(context.TODO(), make([]byte, 1024*1024)))
+
+	err := plan.Execute(context.TODO(), restic.NewNoopPrinter())
+	rtest.Assert(t, errors.Is(err, repository.ErrRepositoryChanged), "expected ErrRepositoryChanged, got %v", err)
+
+	// nothing must have been deleted and the in-flight pack must remain
+	after := listPacksInBackend(t, be)
+	rtest.Assert(t, after.Equals(before) || len(after) == len(before)+1,
+		"unexpected pack set change: before %d after %d", len(before), len(after))
+	rtest.Assert(t, len(after) > len(before), "in-flight pack was removed as unreferenced")
+}
+
+// TestPruneDryRunAndRealPlanAgree verifies the decision-set parity contract:
+// for an unchanged repository, the packs selected by a dry-run plan and a
+// real plan are identical and executing the real plan removes exactly the
+// union reported by the dry-run.
+func TestPruneDryRunAndRealPlanAgree(t *testing.T) {
+	seed := time.Now().UnixNano()
+	random := rand.New(rand.NewSource(seed))
+	t.Logf("rand initialized with seed %d", seed)
+
+	repo, _, be := repository.TestRepositoryWithVersion(t, 0)
+	createRandomBlobs(t, random, repo, 4, 0.5, true)
+	keep, _ := selectBlobs(t, random, repo, 0.5)
+
+	dryPlan := planPruneWithBlobs(t, repo, keep, true)
+	realPlan := planPruneWithBlobs(t, repo, keep, false)
+
+	rtest.Assert(t, dryPlan.RemovePacksFirst().Equals(realPlan.RemovePacksFirst()),
+		"unreferenced pack sets differ: dry-run %v vs real %v", dryPlan.RemovePacksFirst(), realPlan.RemovePacksFirst())
+	rtest.Assert(t, dryPlan.RemovePacks().Equals(realPlan.RemovePacks()),
+		"unused pack sets differ: dry-run %v vs real %v", dryPlan.RemovePacks(), realPlan.RemovePacks())
+	rtest.Assert(t, dryPlan.RepackPacks().Equals(realPlan.RepackPacks()),
+		"repack pack sets differ: dry-run %v vs real %v", dryPlan.RepackPacks(), realPlan.RepackPacks())
+
+	// executing the dry-run plan must not touch the repository
+	rtest.OK(t, dryPlan.Execute(context.TODO(), restic.NewNoopPrinter()))
+
+	// and the real plan must delete exactly the packs the dry-run reported
+	packsBefore := listPacksInBackend(t, be)
+	rtest.OK(t, realPlan.Execute(context.TODO(), restic.NewNoopPrinter()))
+	packsAfter := listPacksInBackend(t, be)
+
+	expectedRemoved := restic.NewIDSet()
+	expectedRemoved.Merge(dryPlan.RemovePacksFirst())
+	expectedRemoved.Merge(dryPlan.RemovePacks())
+	expectedRemoved.Merge(dryPlan.RepackPacks())
+
+	// repacking can create new packs, so compare only the removed subset
+	gotRemoved := packsBefore.Sub(packsAfter)
+	rtest.Assert(t, gotRemoved.Equals(expectedRemoved),
+		"actual removed packs %v do not match dry-run set %v", gotRemoved, expectedRemoved)
+
+	verified := repository.TestOpenBackend(t, be)
+	repository.TestCheckRepo(t, verified)
 }

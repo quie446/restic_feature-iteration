@@ -216,8 +216,9 @@ func runPruneWithRepo(ctx context.Context, opts PruneOptions, gopts global.Optio
 		RepackUncompressed:  opts.RepackUncompressed,
 	}
 
-	plan, err := repository.PlanPrune(ctx, popts, repo, func(ctx context.Context, repo restic.Repository, usedBlobs restic.FindBlobSet) error {
-		return getUsedBlobs(ctx, repo, usedBlobs, ignoreSnapshots, printer)
+	plan, err := repository.PlanPrune(ctx, popts, repo, func(ctx context.Context, repo restic.Repository, usedBlobs restic.FindBlobSet) (restic.IDSet, error) {
+		snapshots, err := getUsedBlobs(ctx, repo, usedBlobs, ignoreSnapshots, printer)
+		return snapshots, err
 	}, printer)
 	if err != nil {
 		return err
@@ -282,8 +283,9 @@ func printPruneStats(printer restic.Printer, stats repository.PruneStats) error 
 	return nil
 }
 
-func getUsedBlobs(ctx context.Context, repo restic.Repository, usedBlobs restic.FindBlobSet, ignoreSnapshots restic.IDSet, printer restic.Printer) error {
+func getUsedBlobs(ctx context.Context, repo restic.Repository, usedBlobs restic.FindBlobSet, ignoreSnapshots restic.IDSet, printer restic.Printer) (restic.IDSet, error) {
 	var snapshotTrees restic.IDs
+	snapshotIDs := restic.NewIDSet()
 	printer.P("loading all snapshots...")
 	err := data.ForAllSnapshots(ctx, repo, repo, ignoreSnapshots,
 		func(id restic.ID, sn *data.Snapshot, err error) error {
@@ -292,11 +294,12 @@ func getUsedBlobs(ctx context.Context, repo restic.Repository, usedBlobs restic.
 				return err
 			}
 			debug.Log("add snapshot %v (tree %v)", id, *sn.Tree)
+			snapshotIDs.Insert(id)
 			snapshotTrees = append(snapshotTrees, *sn.Tree)
 			return nil
 		})
 	if err != nil {
-		return errors.Fatalf("failed loading snapshot: %v", err)
+		return nil, errors.Fatalf("failed loading snapshot: %v", err)
 	}
 
 	printer.P("finding data that is still in use for %d snapshots", len(snapshotTrees))
@@ -307,8 +310,8 @@ func getUsedBlobs(ctx context.Context, repo restic.Repository, usedBlobs restic.
 
 	err = data.FindUsedBlobs(ctx, repo, snapshotTrees, usedBlobs, bar)
 	if err != nil {
-		return errors.Fatalf("failed finding blobs: %v", err)
+		return nil, errors.Fatalf("failed finding blobs: %v", err)
 	}
 
-	return nil
+	return snapshotIDs, nil
 }

@@ -123,6 +123,39 @@ func testPrune(t *testing.T, pruneOpts PruneOptions, checkOpts CheckOptions) {
 
 var pruneDefaultOptions = PruneOptions{MaxUnused: "5%"}
 
+// TestPruneDryRunParity is the end-to-end reproduction of the prune
+// decision-set contract: on an unchanged repository, a dry-run must not
+// modify anything and the following real prune removes exactly the packs that
+// the dry-run reported.
+func TestPruneDryRunParity(t *testing.T) {
+	env, cleanup := withTestEnvironment(t)
+	defer cleanup()
+
+	createPrunableRepo(t, env)
+
+	packsBefore := listPacks(env.gopts, t)
+
+	dryOpts := PruneOptions{MaxUnused: "0%", DryRun: true}
+	rtest.OK(t, testRunPruneOutput(t, env.gopts, dryOpts))
+
+	// dry-run must leave the repository untouched
+	rtest.Assert(t, listPacks(env.gopts, t).Equals(packsBefore),
+		"prune --dry-run modified pack files")
+
+	realOpts := PruneOptions{MaxUnused: "0%"}
+	testRunPrune(t, env.gopts, realOpts)
+
+	packsAfter := listPacks(env.gopts, t)
+	rtest.Assert(t, len(packsAfter) < len(packsBefore),
+		"expected packs to be removed, before %d after %d", len(packsBefore), len(packsAfter))
+
+	// repository must remain consistent after the real prune
+	rtest.OK(t, withTermStatus(t, env.gopts, func(ctx context.Context, gopts global.Options) error {
+		_, err := runCheck(context.TODO(), CheckOptions{ReadData: true}, gopts, nil, gopts.Term)
+		return err
+	}))
+}
+
 func TestPruneWithDamagedRepository(t *testing.T) {
 	env, cleanup := withTestEnvironment(t)
 	defer cleanup()

@@ -49,6 +49,7 @@ func TestCheckRestoreNoLock(t *testing.T) {
 type listOnceBackend struct {
 	backend.Backend
 	listedFileType map[backend.FileType]bool
+	listedCount    map[backend.FileType]int
 	strictOrder    bool
 }
 
@@ -56,6 +57,7 @@ func newListOnceBackend(be backend.Backend) *listOnceBackend {
 	return &listOnceBackend{
 		Backend:        be,
 		listedFileType: make(map[backend.FileType]bool),
+		listedCount:    make(map[backend.FileType]int),
 		strictOrder:    false,
 	}
 }
@@ -64,18 +66,24 @@ func newOrderedListOnceBackend(be backend.Backend) *listOnceBackend {
 	return &listOnceBackend{
 		Backend:        be,
 		listedFileType: make(map[backend.FileType]bool),
+		listedCount:    make(map[backend.FileType]int),
 		strictOrder:    true,
 	}
 }
 
 func (be *listOnceBackend) List(ctx context.Context, t backend.FileType, fn func(backend.FileInfo) error) error {
-	if t != backend.LockFile && be.listedFileType[t] {
-		return errors.Errorf("tried listing type %v the second time", t)
+	// prune re-reads the current snapshot/index/pack state right before
+	// deleting anything to fence a concurrent backup; those deliberate
+	// read-only re-enumerations are allowed once.
+	const maxLists = 2
+	if t != backend.LockFile && be.listedFileType[t] && be.listedCount[t] >= maxLists {
+		return errors.Errorf("tried listing type %v more than %d times", t, maxLists)
 	}
 	if be.strictOrder && t == backend.SnapshotFile && be.listedFileType[backend.IndexFile] {
 		return errors.Errorf("tried listing type snapshots after index")
 	}
 	be.listedFileType[t] = true
+	be.listedCount[t]++
 	return be.Backend.List(ctx, t, fn)
 }
 

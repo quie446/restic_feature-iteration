@@ -18,6 +18,7 @@ import (
 var ErrIndexIncomplete = errors.Fatal("index is not complete")
 var ErrPacksMissing = errors.Fatal("packs from index missing in repo")
 var ErrSizeNotMatching = errors.Fatal("pack size does not match calculated size from index")
+var ErrRepositoryChanged = errors.Fatal("repository changed between planning and executing prune; rerun prune to use a fresh plan")
 
 // PruneOptions collects all options for the cleanup command.
 type PruneOptions struct {
@@ -82,6 +83,18 @@ type PrunePlan struct {
 	repo  *Repository
 	stats PruneStats
 	opts  PruneOptions
+
+	// planBasis records the repository state that the decision was derived
+	// from. It is checked again before the plan is executed to make sure
+	// that a concurrent backup (or another command) did not add snapshots,
+	// index files or pack files in the meantime.
+	planBasis planBasis
+}
+
+type planBasis struct {
+	snapshots restic.IDSet // snapshots considered when computing used blobs
+	indexes   restic.IDSet // index files that were known while planning
+	packs     restic.IDSet // pack files that existed while planning
 }
 
 type packInfo struct {
@@ -103,7 +116,7 @@ type packInfoWithID struct {
 
 // PlanPrune selects which files to rewrite and which to delete and which blobs to keep.
 // Also some summary statistics are returned.
-func PlanPrune(ctx context.Context, opts PruneOptions, repo *Repository, getUsedBlobs func(ctx context.Context, repo restic.Repository, usedBlobs restic.FindBlobSet) error, printer restic.Printer) (*PrunePlan, error) {
+func PlanPrune(ctx context.Context, opts PruneOptions, repo *Repository, getUsedBlobs func(ctx context.Context, repo restic.Repository, usedBlobs restic.FindBlobSet) (restic.IDSet, error), printer restic.Printer) (*PrunePlan, error) {
 	stats := PruneStats{MessageType: "summary"}
 
 	if opts.UnsafeRecovery {
@@ -121,7 +134,7 @@ func PlanPrune(ctx context.Context, opts PruneOptions, repo *Repository, getUsed
 	}
 
 	usedBlobs := index.NewAssociatedSet[uint8](repo.idx)
-	err := getUsedBlobs(ctx, repo, usedBlobs)
+	snapshots, err := getUsedBlobs(ctx, repo, usedBlobs)
 	if err != nil {
 		return nil, err
 	}
@@ -171,6 +184,15 @@ func PlanPrune(ctx context.Context, opts PruneOptions, repo *Repository, getUsed
 	plan.repo = repo
 	plan.stats = stats
 	plan.opts = opts
+
+	// Record the state the decision is based on. The snapshots are the set
+	// of files that getUsedBlobs could have taken into account, the index
+	// files describe the visible pack contents and the pack list is the
+	// set of pack files present in the backend. Execute() revalidates this
+	// basis so that a dry-run and the actual deletion never diverge and so
+	// that data written by a concurrent backup cannot be pruned.
+	plan.planBasis.indexes = repo.idx.IDs()
+	plan.planBasis.snapshots = snapshots
 
 	return &plan, nil
 }
@@ -387,6 +409,7 @@ func decidePackAction(ctx context.Context, opts PruneOptions, repo *Repository, 
 	removePacksFirst := restic.NewIDSet()
 	removePacks := restic.NewIDSet()
 	repackPacks := restic.NewIDSet()
+	knownPacks := restic.NewIDSet()
 
 	var repackCandidates []packInfoWithID
 	var repackSmallCandidates []packInfoWithID
@@ -397,6 +420,7 @@ func decidePackAction(ctx context.Context, opts PruneOptions, repo *Repository, 
 	bar := printer.NewCounter("packs processed")
 	bar.SetMax(uint64(len(indexPack)))
 	err := repo.List(ctx, restic.PackFile, func(id restic.ID, packSize int64) error {
+		knownPacks.Insert(id)
 		p, ok := indexPack[id]
 		if !ok {
 			// Pack was not referenced in index and is not used  => immediately remove!
@@ -578,11 +602,29 @@ func decidePackAction(ctx context.Context, opts PruneOptions, repo *Repository, 
 		removePacks: removePacks,
 		repackPacks: repackPacks,
 		ignorePacks: ignorePacks,
+		planBasis:   planBasis{packs: knownPacks},
 	}, nil
 }
 
 func (plan *PrunePlan) Stats() PruneStats {
 	return plan.stats
+}
+
+// RemovePacksFirst returns the set of unreferenced pack files that the plan
+// deletes before any repacking.
+func (plan *PrunePlan) RemovePacksFirst() restic.IDSet {
+	return plan.removePacksFirst
+}
+
+// RepackPacks returns the set of pack files that the plan repacks.
+func (plan *PrunePlan) RepackPacks() restic.IDSet {
+	return plan.repackPacks
+}
+
+// RemovePacks returns the set of no-longer-used pack files that the plan
+// deletes (including repacked packs after Execute completed).
+func (plan *PrunePlan) RemovePacks() restic.IDSet {
+	return plan.removePacks
 }
 
 // Execute does the actual pruning:
@@ -604,6 +646,15 @@ func (plan *PrunePlan) Execute(ctx context.Context, printer restic.Printer) erro
 	}
 
 	repo := plan.repo
+
+	// Before changing anything, make sure that the repository still matches
+	// the state the plan was computed from. Otherwise the decisions about
+	// packs to delete or repack could remove data that a concurrently
+	// finished backup has since started to reference.
+	if err := plan.revalidate(ctx, printer); err != nil {
+		return err
+	}
+
 	// make sure the plan can only be used once
 	plan.repo = nil
 
@@ -686,6 +737,59 @@ func (plan *PrunePlan) Execute(ctx context.Context, printer restic.Printer) erro
 	repo.clearIndex()
 
 	printer.P("done\n")
+	return nil
+}
+
+// revalidate reloads repository state that may have changed since the plan
+// was created and aborts if another process added snapshots, index files or
+// pack files in the meantime. Deleting anything under those conditions could
+// remove data that is still referenced.
+func (plan *PrunePlan) revalidate(ctx context.Context, printer restic.Printer) error {
+	repo := plan.repo
+
+	// Re-enumerate the three file classes the decision depends on. Every
+	// completed backup publishes new snapshot/index files; packs can only
+	// become referenced through such an index. Listing the current state
+	// therefore reliably fences a concurrent writer, including the window
+	// where packs are already uploaded but no index references them yet.
+	if err := plan.checkBasisChanged(ctx, repo, printer, restic.IndexFile, plan.planBasis.indexes, "index file(s)"); err != nil {
+		return err
+	}
+	if err := plan.checkBasisChanged(ctx, repo, printer, restic.PackFile, plan.planBasis.packs, "pack file(s)"); err != nil {
+		return err
+	}
+	if plan.planBasis.snapshots != nil {
+		if err := plan.checkBasisChanged(ctx, repo, printer, restic.SnapshotFile, plan.planBasis.snapshots, "snapshot(s)"); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// checkBasisChanged lists the given file type once and compares it against the
+// set recorded while planning. It returns ErrRepositoryChanged if additional
+// files appeared, since deleting or repacking under those conditions could
+// remove data that a concurrent command has just started to reference.
+func (plan *PrunePlan) checkBasisChanged(ctx context.Context, repo *Repository, printer restic.Printer, t restic.FileType, expected restic.IDSet, kind string) error {
+	list, err := restic.MemorizeList(ctx, repo, t)
+	if err != nil {
+		return err
+	}
+
+	current := restic.NewIDSet()
+	if err := list.List(ctx, t, func(id restic.ID, _ int64) error {
+		current.Insert(id)
+		return nil
+	}); err != nil {
+		return err
+	}
+
+	if newFiles := current.Sub(expected); len(newFiles) > 0 {
+		printer.E("repository changed since the prune plan was created: %d new %s appeared\n%v",
+			len(newFiles), kind, newFiles)
+		return ErrRepositoryChanged
+	}
 	return nil
 }
 
