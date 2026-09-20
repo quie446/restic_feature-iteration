@@ -235,6 +235,10 @@ func runPruneWithRepo(ctx context.Context, opts PruneOptions, gopts global.Optio
 		if err != nil {
 			return err
 		}
+	} else if popts.DryRun {
+		// in dry-run mode, report the exact sets of packs that a real run
+		// with the same repository state would repack and delete
+		gopts.Term.Print(ui.ToJSONString(plan.Summary()))
 	} else {
 		gopts.Term.Print(ui.ToJSONString(plan.Stats()))
 	}

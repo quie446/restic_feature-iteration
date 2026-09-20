@@ -46,16 +46,18 @@ func TestCheckRestoreNoLock(t *testing.T) {
 // listing filetypes more than once may cause problems with eventually consistent
 // backends (like e.g. Amazon S3) as the second listing may be inconsistent to what
 // is expected by the first listing + some operations.
+// The index may be listed twice: prune incrementally reloads it before
+// deleting files to recheck its plan against concurrent modifications.
 type listOnceBackend struct {
 	backend.Backend
-	listedFileType map[backend.FileType]bool
+	listedFileType map[backend.FileType]int
 	strictOrder    bool
 }
 
 func newListOnceBackend(be backend.Backend) *listOnceBackend {
 	return &listOnceBackend{
 		Backend:        be,
-		listedFileType: make(map[backend.FileType]bool),
+		listedFileType: make(map[backend.FileType]int),
 		strictOrder:    false,
 	}
 }
@@ -63,19 +65,23 @@ func newListOnceBackend(be backend.Backend) *listOnceBackend {
 func newOrderedListOnceBackend(be backend.Backend) *listOnceBackend {
 	return &listOnceBackend{
 		Backend:        be,
-		listedFileType: make(map[backend.FileType]bool),
+		listedFileType: make(map[backend.FileType]int),
 		strictOrder:    true,
 	}
 }
 
 func (be *listOnceBackend) List(ctx context.Context, t backend.FileType, fn func(backend.FileInfo) error) error {
-	if t != backend.LockFile && be.listedFileType[t] {
-		return errors.Errorf("tried listing type %v the second time", t)
+	maxListings := 1
+	if t == backend.IndexFile {
+		maxListings = 2
 	}
-	if be.strictOrder && t == backend.SnapshotFile && be.listedFileType[backend.IndexFile] {
+	if t != backend.LockFile && be.listedFileType[t] >= maxListings {
+		return errors.Errorf("tried listing type %v more than %d times", t, maxListings)
+	}
+	if be.strictOrder && t == backend.SnapshotFile && be.listedFileType[backend.IndexFile] > 0 {
 		return errors.Errorf("tried listing type snapshots after index")
 	}
-	be.listedFileType[t] = true
+	be.listedFileType[t]++
 	return be.Backend.List(ctx, t, fn)
 }
 

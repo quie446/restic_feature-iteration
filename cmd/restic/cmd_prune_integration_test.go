@@ -9,6 +9,7 @@ import (
 	"github.com/restic/restic/internal/backend"
 	"github.com/restic/restic/internal/global"
 	"github.com/restic/restic/internal/repository"
+	"github.com/restic/restic/internal/restic"
 	rtest "github.com/restic/restic/internal/test"
 )
 
@@ -282,4 +283,57 @@ func TestPruneJSON(t *testing.T) {
 	rtest.Equals(t, "summary", stats.MessageType)
 	rtest.Assert(t, stats.Blobs.Total > 0, "expected non-zero total blobs, got %v", stats.Blobs.Total)
 	rtest.Assert(t, stats.Packs.Total > 0, "expected non-zero total packs, got %v", stats.Packs.Total)
+}
+
+// TestPruneDryRunConsistency pins that the packs reported by a prune dry-run
+// are exactly the packs deleted by a real prune run on the same repository
+// state, and that the dry-run itself does not modify the repository.
+func TestPruneDryRunConsistency(t *testing.T) {
+	env, cleanup := withTestEnvironment(t)
+	defer cleanup()
+
+	createPrunableRepo(t, env)
+
+	packsBefore := restic.NewIDSet(testRunList(t, env.gopts, "packs")...)
+
+	// the dry-run reports the packs it would repack and delete
+	buf, err := withCaptureStdout(t, env.gopts, func(ctx context.Context, gopts global.Options) error {
+		gopts.JSON = true
+		oldHook := gopts.BackendTestHook
+		gopts.BackendTestHook = func(r backend.Backend) (backend.Backend, error) { return newListOnceBackend(r), nil }
+		defer func() {
+			gopts.BackendTestHook = oldHook
+		}()
+		dryRunOpts := pruneDefaultOptions
+		dryRunOpts.DryRun = true
+		return runPrune(ctx, dryRunOpts, gopts, gopts.Term)
+	})
+	rtest.OK(t, err)
+
+	var summary repository.PrunePlanSummary
+	rtest.OK(t, json.Unmarshal(buf.Bytes(), &summary))
+	reported := restic.NewIDSet()
+	for _, ids := range []restic.IDs{summary.RemovePacksFirst, summary.RepackPacks, summary.RemovePacks} {
+		for _, id := range ids {
+			reported.Insert(id)
+		}
+	}
+	rtest.Assert(t, len(reported) > 0, "expected prune dry-run to select packs for deletion")
+
+	// the dry-run must not modify the repository
+	rtest.Assert(t, restic.NewIDSet(testRunList(t, env.gopts, "packs")...).Equals(packsBefore),
+		"prune dry-run must not delete packs")
+
+	// the real run must delete exactly the packs reported by the dry-run
+	testRunPrune(t, env.gopts, pruneDefaultOptions)
+
+	packsAfter := restic.NewIDSet(testRunList(t, env.gopts, "packs")...)
+	deleted := packsBefore.Sub(packsAfter)
+	rtest.Assert(t, deleted.Equals(reported), "prune deleted packs %v, but dry-run reported %v", deleted, reported)
+
+	// the repository must still be consistent
+	rtest.OK(t, withTermStatus(t, env.gopts, func(ctx context.Context, gopts global.Options) error {
+		_, err := runCheck(context.TODO(), CheckOptions{ReadData: true}, gopts, nil, gopts.Term)
+		return err
+	}))
 }

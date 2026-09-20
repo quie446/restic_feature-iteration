@@ -82,6 +82,10 @@ type PrunePlan struct {
 	repo  *Repository
 	stats PruneStats
 	opts  PruneOptions
+
+	// getUsedBlobs is kept to recheck the plan against the current
+	// repository state before deleting anything
+	getUsedBlobs func(ctx context.Context, repo restic.Repository, usedBlobs restic.FindBlobSet) error
 }
 
 type packInfo struct {
@@ -171,6 +175,7 @@ func PlanPrune(ctx context.Context, opts PruneOptions, repo *Repository, getUsed
 	plan.repo = repo
 	plan.stats = stats
 	plan.opts = opts
+	plan.getUsedBlobs = getUsedBlobs
 
 	return &plan, nil
 }
@@ -585,9 +590,134 @@ func (plan *PrunePlan) Stats() PruneStats {
 	return plan.stats
 }
 
+// PrunePlanSummary describes the changes selected by a prune plan in a
+// machine-readable form. A prune dry-run and a real prune run starting from
+// the same repository state select exactly the packs listed here.
+type PrunePlanSummary struct {
+	PruneStats
+	// RemovePacksFirst are unreferenced packs that would be deleted first.
+	RemovePacksFirst restic.IDs `json:"remove_packs_first"`
+	// RepackPacks are packs whose still used blobs would be rewritten into
+	// new packs, afterwards the packs would be deleted.
+	RepackPacks restic.IDs `json:"repack_packs"`
+	// RemovePacks are packs without any used blobs that would be deleted.
+	RemovePacks restic.IDs `json:"remove_packs"`
+}
+
+// Summary returns the prune statistics together with the exact sets of packs
+// selected for repacking and deletion.
+func (plan *PrunePlan) Summary() PrunePlanSummary {
+	return PrunePlanSummary{
+		PruneStats:       plan.stats,
+		RemovePacksFirst: plan.removePacksFirst.List(),
+		RepackPacks:      plan.repackPacks.List(),
+		RemovePacks:      plan.removePacks.List(),
+	}
+}
+
+// reloadIndexAndDetectChanges incrementally reloads the index and reports
+// whether index files were added or removed by another process since the
+// index was last (re)loaded. Index files written by this prune run itself
+// (e.g. while repacking) are already known to the in-memory index and thus
+// do not count as a change. A backup always writes its index before its
+// snapshot, thus detecting index changes also detects all snapshots that
+// were completed in the meantime.
+func reloadIndexAndDetectChanges(ctx context.Context, repo *Repository, printer restic.Printer) (bool, error) {
+	before := repo.idx.IDs()
+	if err := repo.LoadIndex(ctx, printer); err != nil {
+		return false, err
+	}
+	return !repo.idx.IDs().Equals(before), nil
+}
+
+// spareNewlyReferencedPacks removes all packs from the deletion and
+// repacking sets that are the sole remaining location of a blob referenced
+// by the current repository state. This ensures that a pack is never
+// deleted while a snapshot still references its blobs, e.g. when a
+// concurrently running backup deduplicated against blobs that were
+// unreferenced at planning time. Packs that remain unreferenced are still
+// removed.
+func (plan *PrunePlan) spareNewlyReferencedPacks(ctx context.Context, repo *Repository, usedBlobs *index.AssociatedSet[uint8], printer restic.Printer) {
+	spared := 0
+
+	// Packs that were not referenced by the index at planning time may have
+	// been added to the index by a backup that finished in the meantime.
+	indexed := repo.idx.Packs(nil)
+	for id := range plan.removePacksFirst {
+		if indexed.Has(id) {
+			plan.removePacksFirst.Delete(id)
+			spared++
+		}
+	}
+
+	// Packs selected for removal or repacking may now contain blobs that
+	// are referenced by snapshots written in the meantime. A pack must
+	// survive if it is the sole remaining location of such a blob. Copies
+	// in kept packs or rewritten during repacking suffice to keep the blob.
+	deletionSet := restic.NewIDSet()
+	deletionSet.Merge(plan.removePacks)
+	deletionSet.Merge(plan.repackPacks)
+	for packBlobs := range repo.listPacksFromIndex(ctx, deletionSet) {
+		keepPack := false
+		for _, blob := range packBlobs.Blobs {
+			bh := blob.BlobHandle
+			if !usedBlobs.Has(bh) {
+				continue
+			}
+			if plan.keepBlobs != nil && plan.keepBlobs.Has(bh) {
+				// the blob is already marked for copying during repacking
+				continue
+			}
+			if blobExistsOutsideSets(repo, bh, deletionSet) {
+				continue
+			}
+			keepPack = true
+			break
+		}
+		if !keepPack {
+			continue
+		}
+
+		id := packBlobs.PackID
+		plan.removePacks.Delete(id)
+		if plan.repackPacks.Has(id) {
+			plan.repackPacks.Delete(id)
+			if plan.keepBlobs != nil {
+				// the pack is kept, thus its blobs must not be rewritten
+				for _, blob := range packBlobs.Blobs {
+					plan.keepBlobs.Delete(blob.BlobHandle)
+				}
+			}
+		}
+		spared++
+	}
+
+	if spared > 0 {
+		printer.P("kept %d packs that are referenced by snapshots modified while prune was running", spared)
+	}
+}
+
+// blobExistsOutsideSets returns true if the index knows a copy of the blob
+// in a pack that is not contained in any of the given sets.
+func blobExistsOutsideSets(repo *Repository, bh restic.BlobHandle, sets ...restic.IDSet) bool {
+	for _, pb := range repo.idx.Lookup(bh) {
+		inSet := false
+		for _, set := range sets {
+			if set.Has(pb.Pack) {
+				inSet = true
+				break
+			}
+		}
+		if !inSet {
+			return true
+		}
+	}
+	return false
+}
+
 // Execute does the actual pruning:
-// - remove unreferenced packs first
 // - repack given pack files while keeping the given blobs
+// - recheck that the repository was not modified in the meantime
 // - rebuild the index while ignoring all files that will be deleted
 // - delete the files
 // plan.removePacks and plan.ignorePacks are modified in this function.
@@ -595,10 +725,10 @@ func (plan *PrunePlan) Execute(ctx context.Context, printer restic.Printer) erro
 	if plan.opts.DryRun {
 		printer.V("Repeated prune dry-runs can report slightly different amounts of data to keep or repack. This is expected behavior.\n\n")
 		if len(plan.removePacksFirst) > 0 {
-			printer.V("Would have removed the following unreferenced packs:\n%v\n\n", plan.removePacksFirst)
+			printer.P("Would have removed the following unreferenced packs:\n%v\n\n", plan.removePacksFirst.List())
 		}
-		printer.V("Would have repacked and removed the following packs:\n%v\n\n", plan.repackPacks)
-		printer.V("Would have removed the following no longer used packs:\n%v\n\n", plan.removePacks)
+		printer.P("Would have repacked and removed the following packs:\n%v\n\n", plan.repackPacks.List())
+		printer.P("Would have removed the following no longer used packs:\n%v\n\n", plan.removePacks.List())
 		// Always quit here if DryRun was set!
 		return nil
 	}
@@ -606,18 +736,6 @@ func (plan *PrunePlan) Execute(ctx context.Context, printer restic.Printer) erro
 	repo := plan.repo
 	// make sure the plan can only be used once
 	plan.repo = nil
-
-	// unreferenced packs can be safely deleted first
-	if len(plan.removePacksFirst) != 0 {
-		printer.P("deleting unreferenced packs\n")
-		// ignoring errors is fine here as keeping too many packs cannot damage the repository
-		_ = deleteFiles(ctx, true, &internalRepository{repo}, plan.removePacksFirst, restic.PackFile, printer)
-		// forget unused data
-		plan.removePacksFirst = nil
-	}
-	if ctx.Err() != nil {
-		return ctx.Err()
-	}
 
 	if len(plan.repackPacks) != 0 {
 		printer.P("repacking packs\n")
@@ -629,11 +747,6 @@ func (plan *PrunePlan) Execute(ctx context.Context, printer restic.Printer) erro
 			return errors.Fatalf("%s", err)
 		}
 
-		// Also remove repacked packs
-		plan.removePacks.Merge(plan.repackPacks)
-		// forget unused data
-		plan.repackPacks = nil
-
 		if plan.keepBlobs.Len() != 0 {
 			printer.E("%v was not repacked\n\n"+
 				"Integrity check failed.\n"+
@@ -644,6 +757,44 @@ func (plan *PrunePlan) Execute(ctx context.Context, printer restic.Printer) erro
 
 		// allow GC of the blob set
 		plan.keepBlobs = nil
+	}
+
+	// Planning and repacking can take a long time. Before deleting
+	// anything, recheck that the packs selected for deletion are still
+	// unreferenced. A backup that finished in the meantime (possible when
+	// the exclusive lock was bypassed or removed as stale) may have
+	// written snapshots that reference packs which the plan considers
+	// garbage.
+	if len(plan.removePacksFirst)+len(plan.removePacks)+len(plan.repackPacks) > 0 {
+		changed, err := reloadIndexAndDetectChanges(ctx, repo, printer)
+		if err != nil {
+			return err
+		}
+		if changed {
+			printer.P("repository was modified while prune was running, rechecking that packs selected for deletion are still unreferenced")
+			usedBlobs := index.NewAssociatedSet[uint8](repo.idx)
+			if err := plan.getUsedBlobs(ctx, repo, usedBlobs); err != nil {
+				return err
+			}
+			plan.spareNewlyReferencedPacks(ctx, repo, usedBlobs, printer)
+		}
+	}
+
+	// Also remove repacked packs
+	plan.removePacks.Merge(plan.repackPacks)
+	// forget unused data
+	plan.repackPacks = nil
+
+	// unreferenced packs can be safely deleted
+	if len(plan.removePacksFirst) != 0 {
+		printer.P("deleting unreferenced packs\n")
+		// ignoring errors is fine here as keeping too many packs cannot damage the repository
+		_ = deleteFiles(ctx, true, &internalRepository{repo}, plan.removePacksFirst, restic.PackFile, printer)
+		// forget unused data
+		plan.removePacksFirst = nil
+	}
+	if ctx.Err() != nil {
+		return ctx.Err()
 	}
 
 	if len(plan.ignorePacks) == 0 {
